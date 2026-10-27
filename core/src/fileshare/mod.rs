@@ -1,4 +1,5 @@
 mod types;
-pub use types::Fileshare;
+pub use types::*;
 
 mod proto;
+pub use proto::*;
