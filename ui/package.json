@@ -1,0 +1,24 @@
+{
+  "name": "airdroppe-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "check": "tsc --noEmit",
+    "build": "npm run check && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "i18next": "^26.4.7",
+    "preact": "^11.0.1",
+    "preact-iso": "^2.12.2"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.6",
+    "@tailwindcss/vite": "^4.3.3",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4"
+  }
+}

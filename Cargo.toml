@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+exclude = ["ui"]
+members = ["core","app", "cli"]
+
+[workspace.dependencies]
+airdroppe-core = { path = "core" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false
+rpath = false
+overflow-checks = false

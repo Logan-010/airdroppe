@@ -1,0 +1,21 @@
+[package]
+name = "airdroppe"
+version = "0.1.0"
+description = "Airdroppe: simple file transfer"
+authors = ["Logan-010"]
+edition = "2024"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.2" }
+
+[dependencies]
+airdroppe-core = { workspace = true }
+log = "0.4.34"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tauri = { version = "2.12.3" }
+tauri-plugin-log = "2"

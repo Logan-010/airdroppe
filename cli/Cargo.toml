@@ -1,0 +1,8 @@
+[package]
+name = "airdroppe-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal interface for airdroppe"
+authors = ["Logan-010"]
+
+[dependencies]
