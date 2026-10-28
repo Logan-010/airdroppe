@@ -1,5 +1,7 @@
-pub mod dht;
+mod discovery;
+mod fileshare;
 
-pub mod fileshare;
+mod node;
+pub use node::Node;
 
 pub mod code;
