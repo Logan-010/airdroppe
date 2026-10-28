@@ -15,13 +15,13 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 use tokio::{pin, select, sync::RwLock, task};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct NodeConfig {
     identity: String,
     store: PathBuf,
     address: Option<SocketAddr>,
     pkarr_relay_address: Option<String>,
-    relay_map: Option<String>,
+    relay_address: Option<String>,
 }
 
 impl NodeConfig {
@@ -33,8 +33,32 @@ impl NodeConfig {
             store,
             address: None,
             pkarr_relay_address: None,
-            relay_map: None,
+            relay_address: None,
         }
+    }
+
+    pub fn with_address(self, address: Option<SocketAddr>) -> Self {
+        Self { address, ..self }
+    }
+
+    pub fn with_pkarr_relay_address(self, pkarr_relay_address: Option<String>) -> Self {
+        Self {
+            pkarr_relay_address,
+            ..self
+        }
+    }
+
+    pub fn wtih_relay_map(self, relay_address: Option<String>) -> Self {
+        Self {
+            relay_address,
+            ..self
+        }
+    }
+
+    pub fn with_new_identity(self) -> Self {
+        let identity = STANDARD.encode(SecretKey::generate().to_bytes());
+
+        Self { identity, ..self }
     }
 
     fn identity(&self) -> Option<SecretKey> {
@@ -94,7 +118,7 @@ impl Node {
             endpoint_builder = endpoint_builder.bind_addr(a)?;
         }
 
-        if let Some(r) = config.relay_map {
+        if let Some(r) = config.relay_address {
             endpoint_builder =
                 endpoint_builder.relay_mode(RelayMode::Custom(RelayMap::from_iter(vec![
                     RelayUrl::from_str(r.as_str())?,
@@ -139,6 +163,22 @@ impl Node {
         })
     }
 
+    pub async fn nearby(&self) -> HashSet<PublicKey> {
+        self.nearby.read().await.clone()
+    }
+
+    pub fn discovery(&self) -> &PeerDiscovery {
+        &self.discovery
+    }
+
+    pub fn fileshare(&self) -> &Fileshare {
+        &self.fileshare
+    }
+
+    pub fn blobs(&self) -> &BlobsProtocol {
+        &self.blobs
+    }
+
     pub async fn shutdown(&self) -> color_eyre::Result<()> {
         self.router.shutdown().await?;
         self.blobs.shutdown().await?;
@@ -147,7 +187,7 @@ impl Node {
         Ok(())
     }
 
-    pub async fn id(&self) -> PublicKey {
+    pub fn id(&self) -> PublicKey {
         self.endpoint.secret_key().public()
     }
 

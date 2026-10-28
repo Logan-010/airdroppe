@@ -116,7 +116,7 @@ impl Fileshare {
         Ok(res)
     }
 
-    pub async fn get_text_metadata(&self, ticket: &BlobTicket) -> color_eyre::Result<u64> {
+    pub async fn get_text_size(&self, ticket: &BlobTicket) -> color_eyre::Result<u64> {
         let conn = self
             .endpoint
             .connect(ticket.addr().clone(), iroh_blobs::ALPN)
