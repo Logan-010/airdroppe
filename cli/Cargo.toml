@@ -11,6 +11,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 color-eyre = "0.6.5"
 directories = "6.0.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+indicatif = { version = "0.18.6", default-features = false, features = ["unicode-width"] }
 iroh-blobs = { version = "0.103.1", default-features = false }
 tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread", "macros", "fs", "io-std", "io-util"] }
 toml = "1.1.8"

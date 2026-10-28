@@ -48,11 +48,10 @@ pub async fn recv_file(
     while let Some(p) = progress.next().await {
         match p {
             GetProgressItem::Progress(n) => {
-                if let Some(tx) = download_progress_tx.as_ref() {
-                    if tx.send(n).await.is_err() {
+                if let Some(tx) = download_progress_tx.as_ref()
+                    && tx.send(n).await.is_err() {
                         tracing::warn!("Download progress channel closed");
                     }
-                }
             }
             GetProgressItem::Done(_) => break,
             GetProgressItem::Error(e) => bail!(e),
@@ -88,11 +87,10 @@ pub async fn recv_file(
     while let Some(p) = progress.next().await {
         match p {
             ExportProgressItem::CopyProgress(n) => {
-                if let Some(tx) = export_progress_tx.as_ref() {
-                    if tx.send(n).await.is_err() {
+                if let Some(tx) = export_progress_tx.as_ref()
+                    && tx.send(n).await.is_err() {
                         tracing::warn!("Export progress channel closed");
                     }
-                }
             }
             ExportProgressItem::Done => break,
             ExportProgressItem::Error(e) => bail!(e),
@@ -125,11 +123,10 @@ pub async fn recv_files(
     while let Some(p) = progress.next().await {
         match p {
             GetProgressItem::Progress(n) => {
-                if let Some(tx) = download_progress_tx.as_ref() {
-                    if tx.send(n).await.is_err() {
+                if let Some(tx) = download_progress_tx.as_ref()
+                    && tx.send(n).await.is_err() {
                         tracing::warn!("Download progress channel closed");
                     }
-                }
             }
             GetProgressItem::Done(_) => break,
             GetProgressItem::Error(e) => bail!(e),
@@ -137,6 +134,8 @@ pub async fn recv_files(
     }
 
     let collection = Collection::load(ticket.hash(), node.blobs().store()).await?;
+
+    let mut exported_bytes = 0;
 
     for (name, hash) in collection.into_iter() {
         let mut components = Path::new(&name).components();
@@ -157,18 +156,26 @@ pub async fn recv_files(
             .stream()
             .await;
 
+        let mut file_size = 0;
+
         while let Some(p) = progress.next().await {
             match p {
+                ExportProgressItem::Size(size) => file_size = size,
                 ExportProgressItem::CopyProgress(n) => {
-                    if let Some(tx) = export_progress_tx.as_ref() {
-                        if tx.send(n).await.is_err() {
+                    if let Some(tx) = export_progress_tx.as_ref()
+                        && tx.send(exported_bytes + n).await.is_err() {
                             tracing::warn!("Export progress channel closed");
                         }
-                    }
                 }
-                ExportProgressItem::Done => break,
+                ExportProgressItem::Done => {
+                    exported_bytes += file_size;
+                    if let Some(tx) = export_progress_tx.as_ref()
+                        && tx.send(exported_bytes).await.is_err() {
+                            tracing::warn!("Export progress channel closed");
+                        }
+                    break;
+                }
                 ExportProgressItem::Error(e) => bail!(e),
-                _ => {}
             }
         }
     }

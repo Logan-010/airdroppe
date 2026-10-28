@@ -2,18 +2,85 @@ mod cli;
 mod recv;
 mod send;
 
-use airdroppe_core::{Node, NodeConfig, ShareType};
+use airdroppe_core::{Node, NodeConfig, Share, ShareType};
 use clap::Parser;
 use cli::{Cli, Mode};
-use color_eyre::eyre::ContextCompat;
+use color_eyre::eyre::{ContextCompat, bail};
 use directories::ProjectDirs;
 use futures_util::StreamExt;
-use std::path::PathBuf;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use iroh_blobs::ticket::BlobTicket;
+use std::path::{Path, PathBuf};
 use tokio::{
     fs,
     io::{AsyncBufReadExt, BufReader, stdin},
+    sync::mpsc,
 };
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+fn progress_bar(size: u64) -> ProgressBar {
+    let pb = ProgressBar::new(size);
+    pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{prefix} {spinner} [{elapsed_precise}] [{wide_bar}] {percent_precise} ({bytes_per_sec}, {eta})")
+                    .unwrap()
+                    .progress_chars("#>-"),
+            );
+    pb
+}
+
+async fn receive_with_progress(
+    node: &Node,
+    base: &Path,
+    share: Share,
+    size: u64,
+) -> color_eyre::Result<()> {
+    let bars = MultiProgress::new();
+    let download = bars.add(progress_bar(size));
+    download.set_prefix("Download");
+    let export = bars.add(progress_bar(size));
+    export.set_prefix("Export");
+
+    let (download_tx, mut download_rx) = mpsc::channel(32);
+    let (export_tx, mut export_rx) = mpsc::channel(32);
+
+    let receive = async {
+        match share.share {
+            ShareType::File => {
+                recv::recv_file(node, base, share, Some(download_tx), Some(export_tx)).await
+            }
+            ShareType::Files => {
+                recv::recv_files(node, base, share, Some(download_tx), Some(export_tx)).await
+            }
+            ShareType::Text => unreachable!("Text transfers do not export files"),
+        }
+    };
+
+    let (result, (), ()) = tokio::join!(
+        receive,
+        async {
+            while let Some(bytes) = download_rx.recv().await {
+                download.set_position(bytes.min(size));
+            }
+        },
+        async {
+            while let Some(bytes) = export_rx.recv().await {
+                download.finish();
+                export.set_position(bytes.min(size));
+            }
+        },
+    );
+
+    if result.is_ok() {
+        download.finish();
+        export.finish();
+    } else {
+        download.abandon();
+        export.abandon();
+    }
+
+    result
+}
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
@@ -156,7 +223,10 @@ async fn main() -> color_eyre::Result<()> {
                             continue;
                         }
 
-                        // Get file
+                        match receive_with_progress(&node, &base, request, size).await {
+                            Ok(()) => println!("Received {name} in {}", base.display()),
+                            Err(e) => tracing::warn!("Failed to receive file: {e:?}"),
+                        }
                     }
                     ShareType::Files => {
                         let meta = match node.fileshare().get_files_metadata(&ticket).await {
@@ -194,12 +264,41 @@ async fn main() -> color_eyre::Result<()> {
                             continue;
                         }
 
-                        // Get files
+                        let size = meta.iter().map(|(_, size)| *size).sum();
+                        match receive_with_progress(&node, &base, request, size).await {
+                            Ok(()) => {
+                                println!("Received {} files in {}", meta.len(), base.display())
+                            }
+                            Err(e) => tracing::warn!("Failed to receive files: {e:?}"),
+                        }
                     }
                 }
             }
         }
-        Some(Mode::Send { text, path, code }) => {}
+        Some(Mode::Send { text, path, code }) => {
+            let Some(id) = node.discovery().resolve(&code, None).await? else {
+                bail!("No providers for code");
+            };
+
+            let share = match (text, path) {
+                (Some(t), None) => {
+                    let tag = node.blobs().blobs().add_bytes(t).await?;
+                    let ticket = BlobTicket::new(node.id().into(), tag.hash, tag.format);
+
+                    Share::new(ticket, ShareType::Text)
+                }
+                (None, Some(p)) => {
+                    todo!()
+                }
+                _ => unreachable!(),
+            };
+
+            if node.fileshare().send_share(id, share).await? {
+                todo!()
+            } else {
+                tracing::warn!("Node rejected share");
+            }
+        }
         None => {
             // TUI is a TODO
         }
