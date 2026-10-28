@@ -57,7 +57,7 @@
           };
 
           nodejs = pkgs.nodejs_26;
-          npmDepsHash = "sha256-yrlMGBHIGhlkYodY8QeyXXxskcbF86mFLBdEPJQjoLM=";
+          npmDepsHash = "sha256-xIzlaqAVVI4rindEELYS4pv2FSJCESF4RfVQalgOeXY=";
 
           installPhase = ''
             runHook preInstall
@@ -91,25 +91,43 @@
 
         runtimeLibraryPath = lib.makeLibraryPath buildInputs;
 
+        source = lib.cleanSourceWith {
+          src = ./.;
+          filter =
+            path: type:
+            lib.cleanSourceFilter path type
+            && !(builtins.elem (builtins.baseNameOf path) [
+              "target"
+              "node_modules"
+              "dist"
+              ".direnv"
+            ]);
+        };
+
+        cli = naersk-lib.buildPackage {
+          name = "airdroppe-cli";
+          version = (builtins.fromTOML (builtins.readFile ./cli/Cargo.toml)).package.version;
+
+          root = source;
+          inherit nativeBuildInputs;
+          buildInputs = [ pkgs.openssl ];
+
+          cargoBuildOptions =
+            options:
+            options
+            ++ [
+              "--package"
+              "airdroppe-cli"
+              "--locked"
+            ];
+        };
+
         app = naersk-lib.buildPackage {
           name = "airdroppe";
 
           version = (builtins.fromTOML (builtins.readFile ./app/Cargo.toml)).package.version;
 
-          root = ./app;
-
-          src = lib.cleanSourceWith {
-            src = ./.;
-            filter =
-              path: type:
-              lib.cleanSourceFilter path type
-              && !(builtins.elem (builtins.baseNameOf path) [
-                "target"
-                "node_modules"
-                "dist"
-                ".direnv"
-              ]);
-          };
+          root = source;
 
           inherit nativeBuildInputs buildInputs;
 
@@ -130,8 +148,8 @@
               ];
 
             postPatch = (attrs.postPatch or "") + ''
-              mkdir -p frontend/dist
-              cp -r ${frontend}/. frontend/dist/
+              mkdir -p ui/dist
+              cp -r ${frontend}/. ui/dist/
             '';
 
             preFixup =
@@ -143,23 +161,13 @@
                 )
               '';
           };
-
-          meta = {
-            description = "Easy P2P file sharing";
-            mainProgram = "airdroppe";
-            platforms = lib.platforms.linux ++ lib.platforms.darwin;
-          };
         };
       in
       {
         packages.default = app;
         packages.airdroppe = app;
+        packages.airdroppe-cli = cli;
         packages.frontend = frontend;
-
-        apps.default = {
-          type = "app";
-          program = "${app}/bin/airdroppe";
-        };
 
         devShells.default = pkgs.mkShell (
           {

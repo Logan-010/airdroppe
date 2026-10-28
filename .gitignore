@@ -3,3 +3,4 @@
 /app/gen/schemas
 /ui/dist
 /ui/node_modules
+/cli/cfg.toml

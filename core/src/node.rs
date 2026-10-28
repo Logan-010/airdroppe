@@ -6,14 +6,32 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use color_eyre::eyre::ContextCompat;
 use futures_util::{Stream, StreamExt};
 use iroh::{
-    Endpoint, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey, endpoint::presets,
+    Endpoint, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey,
+    endpoint::{Connection, presets},
     protocol::Router,
 };
-use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
+use iroh_blobs::{
+    BlobsProtocol, Hash,
+    provider::events::{
+        ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
+    },
+    store::fs::FsStore,
+    ticket::BlobTicket,
+};
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
-use tokio::{pin, select, sync::RwLock, task};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+};
+use tokio::{
+    pin, select,
+    sync::{RwLock, broadcast},
+    task,
+};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct NodeConfig {
@@ -81,6 +99,7 @@ pub struct Node {
     fileshare: Fileshare,
     router: Router,
     nearby: Arc<RwLock<HashSet<PublicKey>>>,
+    upload_progress: broadcast::Sender<(PublicKey, Hash, u64)>,
 }
 
 async fn mdns_task(
@@ -143,7 +162,60 @@ impl Node {
 
         let store = FsStore::load(&config.store).await?;
 
-        let blobs = BlobsProtocol::new(&store, None);
+        let (upload_progress, _) = broadcast::channel(256);
+        let (events, mut events_rx) = EventSender::channel(
+            64,
+            EventMask {
+                connected: ConnectMode::Notify,
+                get: RequestMode::NotifyLog,
+                ..EventMask::DEFAULT
+            },
+        );
+        let progress = upload_progress.clone();
+        task::spawn(async move {
+            let mut peers = HashMap::new();
+            while let Some(event) = events_rx.recv().await {
+                match event {
+                    ProviderMessage::ClientConnectedNotify(msg) => {
+                        if let Some(peer) = msg.endpoint_id {
+                            peers.insert(msg.connection_id, peer);
+                        }
+                    }
+                    ProviderMessage::ConnectionClosed(msg) => {
+                        peers.remove(&msg.connection_id);
+                    }
+                    ProviderMessage::GetRequestReceivedNotify(mut msg) => {
+                        let peer = peers.get(&msg.connection_id).copied();
+                        let hash = msg.request.hash;
+                        let progress = progress.clone();
+                        task::spawn(async move {
+                            let mut completed = 0;
+                            let mut current_size = 0;
+                            while let Ok(Some(update)) = msg.rx.recv().await {
+                                let bytes = match update {
+                                    RequestUpdate::Started(started) => {
+                                        completed += current_size;
+                                        current_size =
+                                            if started.index >= 2 { started.size } else { 0 };
+                                        completed
+                                    }
+                                    RequestUpdate::Progress(update) => {
+                                        completed + update.end_offset.min(current_size)
+                                    }
+                                    RequestUpdate::Completed(_) => completed + current_size,
+                                    RequestUpdate::Aborted(_) => break,
+                                };
+                                if let Some(peer) = peer {
+                                    let _ = progress.send((peer, hash, bytes));
+                                }
+                            }
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let blobs = BlobsProtocol::new(&store, Some(events));
 
         let fileshare = Fileshare::new(endpoint.clone(), blobs.clone());
 
@@ -160,7 +232,15 @@ impl Node {
             fileshare,
             router,
             nearby,
+            upload_progress,
         })
+    }
+
+    pub async fn blob_conn(&self, ticket: &BlobTicket) -> color_eyre::Result<Connection> {
+        Ok(self
+            .endpoint
+            .connect(ticket.addr().clone(), iroh_blobs::ALPN)
+            .await?)
     }
 
     pub async fn nearby(&self) -> HashSet<PublicKey> {
@@ -179,10 +259,14 @@ impl Node {
         &self.blobs
     }
 
+    /// Subscribe to payload-byte upload progress, identified by peer and collection hash.
+    pub fn upload_progress(&self) -> broadcast::Receiver<(PublicKey, Hash, u64)> {
+        self.upload_progress.subscribe()
+    }
+
     pub async fn shutdown(&self) -> color_eyre::Result<()> {
+        // The router shuts down BlobsProtocol, which shuts down its backing store.
         self.router.shutdown().await?;
-        self.blobs.shutdown().await?;
-        self.store.shutdown().await?;
         self.endpoint.close().await;
         Ok(())
     }

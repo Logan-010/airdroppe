@@ -1,4 +1,5 @@
 use color_eyre::eyre::{bail, ensure, eyre};
+use futures_util::{Stream, stream};
 use iroh::{Endpoint, EndpointAddr, endpoint::Connection, protocol::ProtocolHandler};
 use iroh_blobs::{
     BlobsProtocol,
@@ -9,7 +10,7 @@ use iroh_blobs::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, io::Cursor, sync::Arc};
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::{RwLock, broadcast, oneshot};
 
 pub const ALPN: &[u8] = b"/airdroppe/fileshare/1.0.0";
 pub const HANDSHAKE: &[u8] = b"i cant be all about like, spelling and sh*t";
@@ -49,6 +50,8 @@ pub struct Fileshare {
     endpoint: Endpoint,
     blobs: BlobsProtocol,
     accept: Arc<RwLock<HashMap<Share, oneshot::Sender<bool>>>>,
+    finished: Arc<RwLock<HashMap<Share, oneshot::Sender<bool>>>>,
+    requests: broadcast::Sender<Share>,
 }
 
 impl Fileshare {
@@ -57,11 +60,20 @@ impl Fileshare {
             endpoint,
             blobs,
             accept: Arc::new(RwLock::new(HashMap::new())),
+            finished: Arc::new(RwLock::new(HashMap::new())),
+            requests: broadcast::channel(64).0,
         }
     }
 
-    pub async fn requests(&self) -> Vec<Share> {
-        self.accept.read().await.keys().cloned().collect()
+    pub fn requests(
+        &self,
+    ) -> impl Stream<Item = Result<Share, broadcast::error::RecvError>> + Send + use<> {
+        stream::unfold(self.requests.subscribe(), |mut rx| async move {
+            match rx.recv().await {
+                Err(broadcast::error::RecvError::Closed) => None,
+                result => Some((result, rx)),
+            }
+        })
     }
 
     pub async fn accept(&self, share: &Share) -> color_eyre::Result<()> {
@@ -89,6 +101,30 @@ impl Fileshare {
         addr: impl Into<EndpointAddr>,
         share: Share,
     ) -> color_eyre::Result<bool> {
+        self.send_share_inner(addr, share, false).await
+    }
+
+    /// Send a share and keep serving until the receiver confirms completion.
+    pub async fn send_share_and_wait(
+        &self,
+        addr: impl Into<EndpointAddr>,
+        share: Share,
+    ) -> color_eyre::Result<bool> {
+        self.send_share_inner(addr, share, true).await
+    }
+
+    pub async fn complete(&self, share: &Share, success: bool) {
+        if let Some(tx) = self.finished.write().await.remove(share) {
+            let _ = tx.send(success);
+        }
+    }
+
+    async fn send_share_inner(
+        &self,
+        addr: impl Into<EndpointAddr>,
+        share: Share,
+        wait_for_completion: bool,
+    ) -> color_eyre::Result<bool> {
         let conn = self.endpoint.connect(addr, ALPN).await?;
 
         let (mut tx, mut rx) = conn.open_bi().await?;
@@ -101,6 +137,7 @@ impl Fileshare {
         };
         tx.write_all(&(encoded.len() as u32).to_le_bytes()).await?;
         tx.write_all(&encoded).await?;
+        tx.finish()?;
 
         let mut code = [0u8; MSG_LEN];
         rx.read_exact(&mut code).await?;
@@ -112,6 +149,11 @@ impl Fileshare {
         } else {
             bail!("Unknown code");
         };
+
+        if res && wait_for_completion {
+            rx.read_exact(&mut code).await?;
+            ensure!(code == MSG_OK, "Receiver failed to save the share");
+        }
 
         Ok(res)
     }
@@ -169,7 +211,10 @@ impl Fileshare {
 
     async fn insert(&self, share: Share) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
-        self.accept.write().await.insert(share, tx);
+        self.accept.write().await.insert(share.clone(), tx);
+        if self.requests.send(share).is_err() {
+            tracing::warn!("Failed to broadcast share");
+        }
         rx
     }
 
@@ -220,13 +265,25 @@ impl Fileshare {
         tracing::debug!("Decoded share {:?}", share);
         tracing::debug!("Awaiting accept/decline...");
 
-        let rx = self.insert(share).await;
+        let (finished_tx, finished_rx) = oneshot::channel();
+        self.finished
+            .write()
+            .await
+            .insert(share.clone(), finished_tx);
+        let rx = self.insert(share.clone()).await;
 
         if rx.await.unwrap_or(false) {
-            tx.write_all(MSG_NO).await?;
-        } else {
             tx.write_all(MSG_OK).await?;
+            let success = finished_rx.await.unwrap_or(false);
+            tx.write_all(if success { MSG_OK } else { MSG_NO }).await?;
+        } else {
+            self.finished.write().await.remove(&share);
+            tx.write_all(MSG_NO).await?;
         }
+
+        // Keep the connection alive until the peer has received the final reply.
+        tx.finish()?;
+        tx.stopped().await?;
 
         Ok(())
     }
@@ -239,5 +296,80 @@ impl ProtocolHandler for Fileshare {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{FutureExt, StreamExt};
+    use iroh::{RelayMode, endpoint::presets};
+    use iroh_blobs::store::mem::MemStore;
+
+    async fn fileshare() -> Fileshare {
+        let endpoint = Endpoint::builder(presets::N0)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        Fileshare::new(endpoint, BlobsProtocol::new(&MemStore::new(), None))
+    }
+
+    fn share(ticket: impl ToString) -> Share {
+        Share {
+            ticket: ticket.to_string(),
+            share: ShareType::Text,
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_subscribe_immediately_and_do_not_replay() {
+        let fileshare = fileshare().await;
+        let _old = fileshare.insert(share("old")).await;
+        let requests = fileshare.requests();
+        let other = fileshare.clone().requests();
+        tokio::pin!(requests, other);
+
+        let request = share("new");
+        let response = fileshare.insert(request.clone()).await;
+        assert_eq!(requests.next().await.unwrap().unwrap(), request);
+        assert_eq!(other.next().await.unwrap().unwrap(), request);
+        fileshare.accept(&request).await.unwrap();
+        assert!(response.await.unwrap());
+
+        let request = share("rejected");
+        let response = fileshare.insert(request.clone()).await;
+        assert_eq!(requests.next().await.unwrap().unwrap(), request);
+        fileshare.reject(&request).await.unwrap();
+        assert!(!response.await.unwrap());
+        assert!(requests.next().now_or_never().is_none());
+
+        fileshare.endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn requests_report_lag_and_continue() {
+        let fileshare = fileshare().await;
+        let requests = fileshare.requests();
+        tokio::pin!(requests);
+        for index in 0..65 {
+            let _response = fileshare.insert(share(index)).await;
+        }
+        assert!(matches!(
+            requests.next().await,
+            Some(Err(broadcast::error::RecvError::Lagged(1)))
+        ));
+        assert_eq!(requests.next().await.unwrap().unwrap(), share(1));
+        fileshare.endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn requests_end_when_all_fileshare_handles_are_dropped() {
+        let fileshare = fileshare().await;
+        let requests = fileshare.requests();
+        tokio::pin!(requests);
+        fileshare.endpoint.close().await;
+        drop(fileshare);
+        assert!(requests.next().await.is_none());
     }
 }
