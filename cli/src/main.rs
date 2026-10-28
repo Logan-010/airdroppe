@@ -1,4 +1,6 @@
 mod cli;
+mod recv;
+mod send;
 
 use airdroppe_core::{Node, NodeConfig, ShareType};
 use clap::Parser;
@@ -93,16 +95,27 @@ async fn main() -> color_eyre::Result<()> {
                             'sl: while let Some(line) = lines.next_line().await? {
                                 match line.to_lowercase().as_str() {
                                     "yes" | "y" | "o" | "ok" | "okay" => break 'sl,
-                                    "no" | "n" | "nope" => continue 'rl,
+                                    "no" | "n" | "nope" => {
+                                        if let Err(e) = node.fileshare().reject(&request).await {
+                                            tracing::warn!("Reject share error: {e:?}");
+                                        }
+                                        continue 'rl;
+                                    }
                                     _ => println!(
                                         "Please answer the question.\nAccept text transfer ({size} bytes): "
                                     ),
                                 }
                             }
 
-                            node.fileshare().accept(&request).await?;
+                            if let Err(e) = node.fileshare().accept(&request).await {
+                                tracing::warn!("Accept share error: {e:?}");
+                                continue;
+                            }
 
-                            // Get text
+                            match recv::recv_text(&node, request).await {
+                                Ok(t) => println!("{t}"),
+                                Err(e) => tracing::warn!("Failed to get text {e:?}"),
+                            }
                         }
                         ShareType::File => {
                             let (name, size) =
@@ -120,14 +133,22 @@ async fn main() -> color_eyre::Result<()> {
                             'sl: while let Some(line) = lines.next_line().await? {
                                 match line.to_lowercase().as_str() {
                                     "yes" | "y" | "o" | "ok" | "okay" => break 'sl,
-                                    "no" | "n" | "nope" => continue 'rl,
+                                    "no" | "n" | "nope" => {
+                                        if let Err(e) = node.fileshare().reject(&request).await {
+                                            tracing::warn!("Reject share error: {e:?}");
+                                        }
+                                        continue 'rl;
+                                    }
                                     _ => println!(
                                         "Please answer the question.\nAccept file {name} ({size} bytes): "
                                     ),
                                 }
                             }
 
-                            node.fileshare().accept(&request).await?;
+                            if let Err(e) = node.fileshare().accept(&request).await {
+                                tracing::warn!("Accept share error: {e:?}");
+                                continue;
+                            }
 
                             // Get file
                         }
@@ -148,7 +169,12 @@ async fn main() -> color_eyre::Result<()> {
                             'sl: while let Some(line) = lines.next_line().await? {
                                 match line.to_lowercase().as_str() {
                                     "yes" | "y" | "o" | "ok" | "okay" => break 'sl,
-                                    "no" | "n" | "nope" => continue 'rl,
+                                    "no" | "n" | "nope" => {
+                                        if let Err(e) = node.fileshare().reject(&request).await {
+                                            tracing::warn!("Reject share error: {e:?}");
+                                        }
+                                        continue 'rl;
+                                    }
                                     _ => {
                                         println!("Please answer the question.\nAccept files?");
                                         meta.iter().for_each(|(name, size)| {
@@ -158,7 +184,10 @@ async fn main() -> color_eyre::Result<()> {
                                 }
                             }
 
-                            node.fileshare().accept(&request).await?;
+                            if let Err(e) = node.fileshare().accept(&request).await {
+                                tracing::warn!("Accept share error: {e:?}");
+                                continue;
+                            }
 
                             // Get files
                         }
