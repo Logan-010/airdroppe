@@ -34,6 +34,7 @@ pub enum Mode {
     },
     #[command(group(
         ArgGroup::new("input")
+            .args(["text", "path"])
             .required(true)
             .multiple(false)
     ))]
@@ -48,6 +49,49 @@ pub enum Mode {
         path: Option<PathBuf>,
 
         /// Receiver code
+        #[arg(long, short = 'c', env = "AIRDROPPE_CODE")]
         code: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_accepts_text_or_path() {
+        for input in [["-t", "hello"], ["-p", "example.txt"]] {
+            assert!(
+                Cli::try_parse_from([
+                    "airdroppe-cli",
+                    "send",
+                    "-c",
+                    "paddle-choose-sample",
+                    input[0],
+                    input[1],
+                ])
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn send_requires_exactly_one_input() {
+        assert!(
+            Cli::try_parse_from(["airdroppe-cli", "send", "-c", "paddle-choose-sample",]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "airdroppe-cli",
+                "send",
+                "-c",
+                "paddle-choose-sample",
+                "-t",
+                "hello",
+                "-p",
+                "example.txt",
+            ])
+            .is_err()
+        );
+    }
 }

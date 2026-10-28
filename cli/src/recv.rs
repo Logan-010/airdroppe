@@ -49,9 +49,10 @@ pub async fn recv_file(
         match p {
             GetProgressItem::Progress(n) => {
                 if let Some(tx) = download_progress_tx.as_ref()
-                    && tx.send(n).await.is_err() {
-                        tracing::warn!("Download progress channel closed");
-                    }
+                    && tx.send(n).await.is_err()
+                {
+                    tracing::warn!("Download progress channel closed");
+                }
             }
             GetProgressItem::Done(_) => break,
             GetProgressItem::Error(e) => bail!(e),
@@ -88,9 +89,10 @@ pub async fn recv_file(
         match p {
             ExportProgressItem::CopyProgress(n) => {
                 if let Some(tx) = export_progress_tx.as_ref()
-                    && tx.send(n).await.is_err() {
-                        tracing::warn!("Export progress channel closed");
-                    }
+                    && tx.send(n).await.is_err()
+                {
+                    tracing::warn!("Export progress channel closed");
+                }
             }
             ExportProgressItem::Done => break,
             ExportProgressItem::Error(e) => bail!(e),
@@ -124,9 +126,10 @@ pub async fn recv_files(
         match p {
             GetProgressItem::Progress(n) => {
                 if let Some(tx) = download_progress_tx.as_ref()
-                    && tx.send(n).await.is_err() {
-                        tracing::warn!("Download progress channel closed");
-                    }
+                    && tx.send(n).await.is_err()
+                {
+                    tracing::warn!("Download progress channel closed");
+                }
             }
             GetProgressItem::Done(_) => break,
             GetProgressItem::Error(e) => bail!(e),
@@ -138,8 +141,12 @@ pub async fn recv_files(
     let mut exported_bytes = 0;
 
     for (name, hash) in collection.into_iter() {
-        let mut components = Path::new(&name).components();
-        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        let relative = Path::new(&name);
+        if relative.as_os_str().is_empty()
+            || !relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
             bail!("Invalid filename: {name}");
         }
 
@@ -147,7 +154,28 @@ pub async fn recv_files(
             fs::create_dir_all(base).await?;
         }
 
-        let destination = fs::canonicalize(base).await?.join(name);
+        let base = fs::canonicalize(base).await?;
+        let mut parent = base.clone();
+        if let Some(directories) = relative.parent() {
+            for component in directories.components() {
+                parent.push(component);
+                match fs::create_dir(&parent).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                parent = fs::canonicalize(&parent).await?;
+                if !parent.starts_with(&base) {
+                    bail!("Destination escapes receive directory: {name}");
+                }
+            }
+        }
+        let destination = parent.join(relative.file_name().context("Missing filename")?);
+        if let Ok(metadata) = fs::symlink_metadata(&destination).await
+            && metadata.file_type().is_symlink()
+        {
+            bail!("Refusing to overwrite symlink: {}", destination.display());
+        }
 
         let mut progress = node
             .blobs()
@@ -163,16 +191,18 @@ pub async fn recv_files(
                 ExportProgressItem::Size(size) => file_size = size,
                 ExportProgressItem::CopyProgress(n) => {
                     if let Some(tx) = export_progress_tx.as_ref()
-                        && tx.send(exported_bytes + n).await.is_err() {
-                            tracing::warn!("Export progress channel closed");
-                        }
+                        && tx.send(exported_bytes + n).await.is_err()
+                    {
+                        tracing::warn!("Export progress channel closed");
+                    }
                 }
                 ExportProgressItem::Done => {
                     exported_bytes += file_size;
                     if let Some(tx) = export_progress_tx.as_ref()
-                        && tx.send(exported_bytes).await.is_err() {
-                            tracing::warn!("Export progress channel closed");
-                        }
+                        && tx.send(exported_bytes).await.is_err()
+                    {
+                        tracing::warn!("Export progress channel closed");
+                    }
                     break;
                 }
                 ExportProgressItem::Error(e) => bail!(e),

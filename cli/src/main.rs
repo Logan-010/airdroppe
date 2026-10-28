@@ -1,4 +1,5 @@
 mod cli;
+mod progress;
 mod recv;
 mod send;
 
@@ -8,8 +9,8 @@ use cli::{Cli, Mode};
 use color_eyre::eyre::{ContextCompat, bail};
 use directories::ProjectDirs;
 use futures_util::StreamExt;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use iroh_blobs::ticket::BlobTicket;
+use indicatif::MultiProgress;
+use progress::progress_bar;
 use std::path::{Path, PathBuf};
 use tokio::{
     fs,
@@ -17,17 +18,6 @@ use tokio::{
     sync::mpsc,
 };
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
-
-fn progress_bar(size: u64) -> ProgressBar {
-    let pb = ProgressBar::new(size);
-    pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("{prefix} {spinner} [{elapsed_precise}] [{wide_bar}] {percent_precise} ({bytes_per_sec}, {eta})")
-                    .unwrap()
-                    .progress_chars("#>-"),
-            );
-    pb
-}
 
 async fn receive_with_progress(
     node: &Node,
@@ -45,7 +35,8 @@ async fn receive_with_progress(
     let (export_tx, mut export_rx) = mpsc::channel(32);
 
     let receive = async {
-        match share.share {
+        let completed_share = share.clone();
+        let result = match share.share {
             ShareType::File => {
                 recv::recv_file(node, base, share, Some(download_tx), Some(export_tx)).await
             }
@@ -53,7 +44,11 @@ async fn receive_with_progress(
                 recv::recv_files(node, base, share, Some(download_tx), Some(export_tx)).await
             }
             ShareType::Text => unreachable!("Text transfers do not export files"),
-        }
+        };
+        node.fileshare()
+            .complete(&completed_share, result.is_ok())
+            .await;
+        result
     };
 
     let (result, (), ()) = tokio::join!(
@@ -128,7 +123,17 @@ async fn main() -> color_eyre::Result<()> {
 
     let node = Node::new(config).await?;
 
-    match cli.mode {
+    let result = tokio::select! {
+        result = run(&node, cli.mode) => result,
+        result = tokio::signal::ctrl_c() => result.map_err(Into::into),
+    };
+
+    node.shutdown().await?;
+    result
+}
+
+async fn run(node: &Node, mode: Option<Mode>) -> color_eyre::Result<()> {
+    match mode {
         Some(Mode::Recv { to, code_length }) => {
             let base = to.unwrap_or_else(|| PathBuf::from("."));
             let requests = node.fileshare().requests();
@@ -186,7 +191,9 @@ async fn main() -> color_eyre::Result<()> {
                             continue;
                         }
 
-                        match recv::recv_text(&node, request).await {
+                        let result = recv::recv_text(&node, request.clone()).await;
+                        node.fileshare().complete(&request, result.is_ok()).await;
+                        match result {
                             Ok(t) => println!("{t}"),
                             Err(e) => tracing::warn!("Failed to get text {e:?}"),
                         }
@@ -280,23 +287,44 @@ async fn main() -> color_eyre::Result<()> {
                 bail!("No providers for code");
             };
 
-            let share = match (text, path) {
-                (Some(t), None) => {
-                    let tag = node.blobs().blobs().add_bytes(t).await?;
-                    let ticket = BlobTicket::new(node.id().into(), tag.hash, tag.format);
-
-                    Share::new(ticket, ShareType::Text)
-                }
+            match (text, path) {
+                (Some(t), None) => send::send_text(&node, t, id).await?,
                 (None, Some(p)) => {
-                    todo!()
+                    let (_, files) = send::path_files(&p).await?;
+                    let size = files.iter().map(|(_, _, size)| *size).sum();
+                    let bars = MultiProgress::new();
+                    let import = bars.add(progress_bar(size));
+                    import.set_prefix("Import");
+                    let upload = bars.add(progress_bar(size));
+                    upload.set_prefix("Upload");
+                    let (import_tx, mut import_rx) = mpsc::channel(32);
+                    let (upload_tx, mut upload_rx) = mpsc::channel(32);
+                    let (result, (), ()) = tokio::join!(
+                        send::send_path(node, &p, id, Some(import_tx), Some(upload_tx)),
+                        async {
+                            while let Some(bytes) = import_rx.recv().await {
+                                import.set_position(bytes.min(size));
+                            }
+                            // Closing this channel marks a successful import, or an error.
+                        },
+                        async {
+                            while let Some(bytes) = upload_rx.recv().await {
+                                import.finish();
+                                upload.set_position(bytes.min(size));
+                            }
+                        },
+                    );
+                    if result.is_ok() {
+                        import.finish();
+                        upload.finish();
+                        println!("Sent {}", p.display());
+                    } else {
+                        import.abandon();
+                        upload.abandon();
+                    }
+                    result?;
                 }
                 _ => unreachable!(),
-            };
-
-            if node.fileshare().send_share(id, share).await? {
-                todo!()
-            } else {
-                tracing::warn!("Node rejected share");
             }
         }
         None => {
