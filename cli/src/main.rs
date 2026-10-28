@@ -7,6 +7,7 @@ use clap::Parser;
 use cli::{Cli, Mode};
 use color_eyre::eyre::ContextCompat;
 use directories::ProjectDirs;
+use futures_util::StreamExt;
 use std::path::PathBuf;
 use tokio::{
     fs,
@@ -63,6 +64,8 @@ async fn main() -> color_eyre::Result<()> {
     match cli.mode {
         Some(Mode::Recv { to, code_length }) => {
             let base = to.unwrap_or_else(|| PathBuf::from("."));
+            let requests = node.fileshare().requests();
+            tokio::pin!(requests);
 
             let code = airdroppe_core::code::generate(code_length);
 
@@ -70,127 +73,128 @@ async fn main() -> color_eyre::Result<()> {
 
             println!("Code \"{code}\"\nWaiting for requests...");
 
-            loop {
-                let requests = node.fileshare().requests().await;
-
-                'rl: for request in requests {
-                    let Some(ticket) = request.ticket() else {
-                        tracing::warn!("Skipping request with invalid ticket");
+            'rl: while let Some(request) = requests.next().await {
+                let request = match request {
+                    Ok(request) => request,
+                    Err(e) => {
+                        tracing::warn!("Missed incoming share requests: {e}");
                         continue;
-                    };
+                    }
+                };
+                let Some(ticket) = request.ticket() else {
+                    tracing::warn!("Skipping request with invalid ticket");
+                    continue;
+                };
 
-                    match request.share {
-                        ShareType::Text => {
-                            let size = match node.fileshare().get_text_size(&ticket).await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::warn!("Failed to get text size {e:?}");
-                                    continue;
-                                }
-                            };
-
-                            println!("Accept text transfer ({size} bytes): ");
-
-                            let mut lines = BufReader::new(stdin()).lines();
-                            'sl: while let Some(line) = lines.next_line().await? {
-                                match line.to_lowercase().as_str() {
-                                    "yes" | "y" | "o" | "ok" | "okay" => break 'sl,
-                                    "no" | "n" | "nope" => {
-                                        if let Err(e) = node.fileshare().reject(&request).await {
-                                            tracing::warn!("Reject share error: {e:?}");
-                                        }
-                                        continue 'rl;
-                                    }
-                                    _ => println!(
-                                        "Please answer the question.\nAccept text transfer ({size} bytes): "
-                                    ),
-                                }
-                            }
-
-                            if let Err(e) = node.fileshare().accept(&request).await {
-                                tracing::warn!("Accept share error: {e:?}");
+                match request.share {
+                    ShareType::Text => {
+                        let size = match node.fileshare().get_text_size(&ticket).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!("Failed to get text size {e:?}");
                                 continue;
                             }
+                        };
 
-                            match recv::recv_text(&node, request).await {
-                                Ok(t) => println!("{t}"),
-                                Err(e) => tracing::warn!("Failed to get text {e:?}"),
+                        println!("Accept text transfer ({size} bytes): ");
+
+                        let mut lines = BufReader::new(stdin()).lines();
+                        'sl: while let Some(line) = lines.next_line().await? {
+                            match line.to_lowercase().as_str() {
+                                "yes" | "y" | "o" | "ok" | "okay" => break 'sl,
+                                "no" | "n" | "nope" => {
+                                    if let Err(e) = node.fileshare().reject(&request).await {
+                                        tracing::warn!("Reject share error: {e:?}");
+                                    }
+                                    continue 'rl;
+                                }
+                                _ => println!(
+                                    "Please answer the question.\nAccept text transfer ({size} bytes): "
+                                ),
                             }
                         }
-                        ShareType::File => {
-                            let (name, size) =
-                                match node.fileshare().get_file_metadata(&ticket).await {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        tracing::warn!("Failed to get file metadata {e:?}");
-                                        continue;
-                                    }
-                                };
 
-                            println!("Accept file {name} ({size} bytes): ");
+                        if let Err(e) = node.fileshare().accept(&request).await {
+                            tracing::warn!("Accept share error: {e:?}");
+                            continue;
+                        }
 
-                            let mut lines = BufReader::new(stdin()).lines();
-                            'sl: while let Some(line) = lines.next_line().await? {
-                                match line.to_lowercase().as_str() {
-                                    "yes" | "y" | "o" | "ok" | "okay" => break 'sl,
-                                    "no" | "n" | "nope" => {
-                                        if let Err(e) = node.fileshare().reject(&request).await {
-                                            tracing::warn!("Reject share error: {e:?}");
-                                        }
-                                        continue 'rl;
-                                    }
-                                    _ => println!(
-                                        "Please answer the question.\nAccept file {name} ({size} bytes): "
-                                    ),
-                                }
-                            }
-
-                            if let Err(e) = node.fileshare().accept(&request).await {
-                                tracing::warn!("Accept share error: {e:?}");
+                        match recv::recv_text(&node, request).await {
+                            Ok(t) => println!("{t}"),
+                            Err(e) => tracing::warn!("Failed to get text {e:?}"),
+                        }
+                    }
+                    ShareType::File => {
+                        let (name, size) = match node.fileshare().get_file_metadata(&ticket).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!("Failed to get file metadata {e:?}");
                                 continue;
                             }
+                        };
 
-                            // Get file
-                        }
-                        ShareType::Files => {
-                            let meta = match node.fileshare().get_files_metadata(&ticket).await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::warn!("Failed to get files metadata {e:?}");
-                                    continue;
-                                }
-                            };
+                        println!("Accept file {name} ({size} bytes): ");
 
-                            println!("Accept files?");
-                            meta.iter()
-                                .for_each(|(name, size)| println!("{name} ({size} bytes)"));
-
-                            let mut lines = BufReader::new(stdin()).lines();
-                            'sl: while let Some(line) = lines.next_line().await? {
-                                match line.to_lowercase().as_str() {
-                                    "yes" | "y" | "o" | "ok" | "okay" => break 'sl,
-                                    "no" | "n" | "nope" => {
-                                        if let Err(e) = node.fileshare().reject(&request).await {
-                                            tracing::warn!("Reject share error: {e:?}");
-                                        }
-                                        continue 'rl;
+                        let mut lines = BufReader::new(stdin()).lines();
+                        'sl: while let Some(line) = lines.next_line().await? {
+                            match line.to_lowercase().as_str() {
+                                "yes" | "y" | "o" | "ok" | "okay" => break 'sl,
+                                "no" | "n" | "nope" => {
+                                    if let Err(e) = node.fileshare().reject(&request).await {
+                                        tracing::warn!("Reject share error: {e:?}");
                                     }
-                                    _ => {
-                                        println!("Please answer the question.\nAccept files?");
-                                        meta.iter().for_each(|(name, size)| {
-                                            println!("{name} ({size} bytes)")
-                                        });
-                                    }
+                                    continue 'rl;
                                 }
+                                _ => println!(
+                                    "Please answer the question.\nAccept file {name} ({size} bytes): "
+                                ),
                             }
+                        }
 
-                            if let Err(e) = node.fileshare().accept(&request).await {
-                                tracing::warn!("Accept share error: {e:?}");
+                        if let Err(e) = node.fileshare().accept(&request).await {
+                            tracing::warn!("Accept share error: {e:?}");
+                            continue;
+                        }
+
+                        // Get file
+                    }
+                    ShareType::Files => {
+                        let meta = match node.fileshare().get_files_metadata(&ticket).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!("Failed to get files metadata {e:?}");
                                 continue;
                             }
+                        };
 
-                            // Get files
+                        println!("Accept files?");
+                        meta.iter()
+                            .for_each(|(name, size)| println!("{name} ({size} bytes)"));
+
+                        let mut lines = BufReader::new(stdin()).lines();
+                        'sl: while let Some(line) = lines.next_line().await? {
+                            match line.to_lowercase().as_str() {
+                                "yes" | "y" | "o" | "ok" | "okay" => break 'sl,
+                                "no" | "n" | "nope" => {
+                                    if let Err(e) = node.fileshare().reject(&request).await {
+                                        tracing::warn!("Reject share error: {e:?}");
+                                    }
+                                    continue 'rl;
+                                }
+                                _ => {
+                                    println!("Please answer the question.\nAccept files?");
+                                    meta.iter()
+                                        .for_each(|(name, size)| println!("{name} ({size} bytes)"));
+                                }
+                            }
                         }
+
+                        if let Err(e) = node.fileshare().accept(&request).await {
+                            tracing::warn!("Accept share error: {e:?}");
+                            continue;
+                        }
+
+                        // Get files
                     }
                 }
             }
